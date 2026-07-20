@@ -1,0 +1,71 @@
+name: Codex Linux Vulkan build
+
+on:
+  push:
+    branches:
+      - codex-vulkan-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-vulkan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            g++ \
+            ninja-build \
+            libopenblas-dev \
+            libvulkan-dev \
+            spirv-headers \
+            glslc
+
+      - name: Configure Vulkan build
+        run: |
+          cmake -S . -B build-vulkan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_VULKAN=ON \
+            -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_AVX2=ON \
+            -DGGML_FMA=ON \
+            -DGGML_F16C=ON \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=ON \
+            -DCRISPASR_BUILD_SERVER=OFF
+
+      - name: Build CLI
+        run: cmake --build build-vulkan --target crispasr-cli -j 4
+
+      - name: Package
+        run: |
+          mkdir -p artifact/crispasr-linux-x86_64-vulkan
+          cp build-vulkan/bin/crispasr artifact/crispasr-linux-x86_64-vulkan/
+          cp LICENSE THIRD_PARTY_NOTICES.txt artifact/crispasr-linux-x86_64-vulkan/
+          tar -C artifact -czf artifact/crispasr-linux-x86_64-vulkan.tar.gz \
+            crispasr-linux-x86_64-vulkan
+          sha256sum artifact/crispasr-linux-x86_64-vulkan.tar.gz \
+            > artifact/crispasr-linux-x86_64-vulkan.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-linux-x86_64-vulkan
+          path: |
+            artifact/crispasr-linux-x86_64-vulkan.tar.gz
+            artifact/crispasr-linux-x86_64-vulkan.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
