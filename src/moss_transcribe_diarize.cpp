@@ -981,7 +981,12 @@ extern "C" bool moss_diarize_kv_init(struct moss_diarize_context* ctx, int max_c
     ggml_set_name(ctx->kv_k, "kv_k");
     ggml_set_name(ctx->kv_v, "kv_v");
 
-    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, ctx->backend);
+    // Honour the shared long-context spill control. This is required on
+    // Vulkan implementations whose maxStorageBufferRange is smaller than a
+    // long-form KV tensor (for example Dozen under WSL).
+    ggml_backend_t kv_backend =
+        core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "moss_diarize");
+    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, kv_backend);
     if (!ctx->kv_buf) {
         fprintf(stderr, "moss_diarize: kv alloc failed for max_ctx=%d\n", max_ctx);
         ggml_free(ctx->kv_ctx);
