@@ -201,6 +201,14 @@ struct moss_diarize_context {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
 
+    // Some Vulkan implementations exposed through WSL (notably Dozen) have a
+    // maxStorageBufferRange smaller than the tied token embedding / output
+    // matrix. Keep a CPU shadow for row lookup and the final vocabulary
+    // projection while the encoder and transformer layers remain on Vulkan.
+    ggml_context* token_embd_cpu_ctx = nullptr;
+    ggml_backend_buffer_t token_embd_cpu_buf = nullptr;
+    ggml_tensor* token_embd_cpu = nullptr;
+
     std::vector<uint8_t> compute_meta;
 
     // KV cache for LLM
@@ -946,8 +954,7 @@ static ggml_cgraph* moss_diarize_build_llm_kv_graph(moss_diarize_context* ctx, i
 
     if (last_token_only && n_tokens > 1)
         cur = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
-    cur = ggml_mul_mat(ctx0, llm.lm_head_w, cur);
-    ggml_set_name(cur, "logits");
+    ggml_set_name(cur, "last_hidden");
     ggml_set_output(cur);
     ggml_build_forward_expand(gf, cur);
     return gf;
@@ -1072,45 +1079,63 @@ extern "C" float* moss_diarize_embed_tokens(struct moss_diarize_context* ctx, co
         return nullptr;
     const int d = (int)ctx->model.hparams.llm_dim;
 
-    if (n_tokens == 1 && ctx->model.llm.embed_w) {
-        const ggml_tensor* w = ctx->model.llm.embed_w;
-        const size_t row_bytes = ggml_row_size(w->type, d);
-        float* result = (float*)malloc((size_t)d * sizeof(float));
-        if (!result)
-            return nullptr;
-        std::vector<uint8_t> raw(row_bytes);
-        ggml_backend_tensor_get(w, raw.data(), (size_t)token_ids[0] * row_bytes, row_bytes);
-        if (w->type == GGML_TYPE_F32)
-            std::memcpy(result, raw.data(), (size_t)d * sizeof(float));
-        else
-            ggml_get_type_traits(w->type)->to_float(raw.data(), result, d);
-        return result;
-    }
-
-    struct ggml_init_params gp = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(gp);
-    ggml_cgraph* gf = ggml_new_graph(ctx0);
-    ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_name(ids, "token_ids");
-    ggml_set_input(ids);
-    ggml_tensor* emb = ggml_get_rows(ctx0, ctx->model.llm.embed_w, ids);
-    ggml_set_name(emb, "embeds");
-    ggml_set_output(emb);
-    ggml_build_forward_expand(gf, emb);
-
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-        ggml_free(ctx0);
+    const ggml_tensor* w = ctx->token_embd_cpu ? ctx->token_embd_cpu : ctx->model.llm.embed_w;
+    if (!w)
         return nullptr;
-    }
-    ggml_backend_tensor_set(ids, token_ids, 0, (size_t)n_tokens * sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
-        ggml_free(ctx0);
-        return nullptr;
-    }
-    ggml_tensor* out = ggml_graph_get_tensor(gf, "embeds");
+    const size_t row_bytes = ggml_row_size(w->type, d);
     float* result = (float*)malloc((size_t)d * n_tokens * sizeof(float));
-    ggml_backend_tensor_get(out, result, 0, (size_t)d * n_tokens * sizeof(float));
+    if (!result)
+        return nullptr;
+    std::vector<uint8_t> raw(row_bytes);
+    for (int i = 0; i < n_tokens; ++i) {
+        if (token_ids[i] < 0 || token_ids[i] >= w->ne[1]) {
+            free(result);
+            return nullptr;
+        }
+        ggml_backend_tensor_get(w, raw.data(), (size_t)token_ids[i] * row_bytes, row_bytes);
+        float* dst = result + (size_t)i * d;
+        if (w->type == GGML_TYPE_F32)
+            std::memcpy(dst, raw.data(), (size_t)d * sizeof(float));
+        else
+            ggml_get_type_traits(w->type)->to_float(raw.data(), dst, d);
+    }
+    return result;
+}
+
+static float* moss_diarize_project_logits_cpu(moss_diarize_context* ctx, const float* hidden) {
+    const int d = (int)ctx->model.hparams.llm_dim;
+    const int vocab = (int)ctx->model.hparams.llm_vocab_size;
+    ggml_tensor* weight = ctx->token_embd_cpu ? ctx->token_embd_cpu : ctx->model.llm.lm_head_w;
+    if (!weight || !ctx->backend_cpu)
+        return nullptr;
+
+    const size_t meta_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(16, false);
+    struct ggml_init_params gp = {meta_size, nullptr, true};
+    ggml_context* ctx0 = ggml_init(gp);
+    if (!ctx0)
+        return nullptr;
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16, false);
+    ggml_tensor* hidden_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, 1);
+    ggml_set_name(hidden_in, "last_hidden_cpu");
+    ggml_set_input(hidden_in);
+    ggml_tensor* logits = ggml_mul_mat(ctx0, weight, hidden_in);
+    ggml_set_name(logits, "logits_cpu");
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx0, ctx->backend_cpu);
+    if (!buf) {
+        ggml_free(ctx0);
+        return nullptr;
+    }
+    ggml_backend_tensor_set(hidden_in, hidden, 0, (size_t)d * sizeof(float));
+    float* result = nullptr;
+    if (ggml_backend_graph_compute(ctx->backend_cpu, gf) == GGML_STATUS_SUCCESS) {
+        result = (float*)malloc((size_t)vocab * sizeof(float));
+        if (result)
+            ggml_backend_tensor_get(logits, result, 0, (size_t)vocab * sizeof(float));
+    }
+    ggml_backend_buffer_free(buf);
     ggml_free(ctx0);
     return result;
 }
@@ -1160,15 +1185,18 @@ extern "C" float* moss_diarize_run_llm_kv(struct moss_diarize_context* ctx, cons
         fprintf(stderr, "moss_diarize: llm compute failed\n");
         return nullptr;
     }
-    ggml_tensor* logits_t = ggml_graph_get_tensor(gf, "logits");
-    if (!logits_t)
+    ggml_tensor* hidden_t = ggml_graph_get_tensor(gf, "last_hidden");
+    if (!hidden_t)
         return nullptr;
     if (out_n_tokens)
         *out_n_tokens = 1;
     if (out_vocab_size)
         *out_vocab_size = vocab;
-    float* result = (float*)malloc((size_t)vocab * sizeof(float));
-    ggml_backend_tensor_get(logits_t, result, 0, (size_t)vocab * sizeof(float));
+    std::vector<float> hidden((size_t)d);
+    ggml_backend_tensor_get(hidden_t, hidden.data(), 0, hidden.size() * sizeof(float));
+    float* result = moss_diarize_project_logits_cpu(ctx, hidden.data());
+    if (!result)
+        return nullptr;
     ctx->kv_n_used = Lk;
     return result;
 }
@@ -1603,6 +1631,36 @@ extern "C" struct moss_diarize_context* moss_diarize_init_from_file(const char* 
         return nullptr;
     }
 
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ctx->token_embd_cpu = ctx->model.llm.embed_w;
+    } else {
+        ggml_tensor* src = ctx->model.llm.embed_w;
+        struct ggml_init_params ep = {ggml_tensor_overhead() * 2, nullptr, true};
+        ctx->token_embd_cpu_ctx = ggml_init(ep);
+        if (!ctx->token_embd_cpu_ctx) {
+            moss_diarize_free(ctx);
+            return nullptr;
+        }
+        ctx->token_embd_cpu = ggml_new_tensor_2d(ctx->token_embd_cpu_ctx, src->type, src->ne[0], src->ne[1]);
+        ggml_set_name(ctx->token_embd_cpu, "token_embd.cpu.weight");
+        ctx->token_embd_cpu_buf = ggml_backend_alloc_ctx_tensors(ctx->token_embd_cpu_ctx, ctx->backend_cpu);
+        if (!ctx->token_embd_cpu_buf) {
+            fprintf(stderr, "moss_diarize: failed to allocate CPU token embedding shadow\n");
+            moss_diarize_free(ctx);
+            return nullptr;
+        }
+        const size_t total = ggml_nbytes(src);
+        const size_t chunk_size = 16u * 1024u * 1024u;
+        std::vector<uint8_t> chunk(std::min(chunk_size, total));
+        for (size_t offset = 0; offset < total; offset += chunk_size) {
+            const size_t n = std::min(chunk_size, total - offset);
+            ggml_backend_tensor_get(src, chunk.data(), offset, n);
+            ggml_backend_tensor_set(ctx->token_embd_cpu, chunk.data(), offset, n);
+        }
+        fprintf(stderr, "moss_diarize: Vulkan active; CPU shadow used only for %.1f MiB tied token embedding/output projection\n",
+                total / (1024.0 * 1024.0));
+    }
+
     return ctx;
 }
 
@@ -1615,6 +1673,10 @@ extern "C" void moss_diarize_free(struct moss_diarize_context* ctx) {
         ggml_free(ctx->kv_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    if (ctx->token_embd_cpu_buf)
+        ggml_backend_buffer_free(ctx->token_embd_cpu_buf);
+    if (ctx->token_embd_cpu_ctx)
+        ggml_free(ctx->token_embd_cpu_ctx);
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.ctx)
