@@ -1,4 +1,4 @@
-name: Codex Linux Vulkan build
+name: Codex Linux GPU builds
 
 on:
   push:
@@ -67,5 +67,93 @@ jobs:
           path: |
             artifact/crispasr-linux-x86_64-vulkan.tar.gz
             artifact/crispasr-linux-x86_64-vulkan.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # GitHub-hosted runners do not need an NVIDIA GPU to compile CUDA kernels.
+  # The resulting binary uses the host NVIDIA driver at runtime, so this job
+  # produces a CUDA-enabled CLI artifact rather than trying to execute it on
+  # the CPU-only runner.
+  build-linux-cuda:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            g++ \
+            ninja-build \
+            libopenblas-dev
+
+      - name: Install CUDA Toolkit 12.8
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '12.8.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "nvrtc-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+
+      - name: Export CUDA linker paths
+        run: |
+          CUDA_ROOT="${CUDA_PATH:-${{ steps.cuda-toolkit.outputs.CUDA_PATH }}}"
+          if [ -z "$CUDA_ROOT" ]; then
+            echo "::error::Jimver/cuda-toolkit did not expose CUDA_PATH"
+            exit 1
+          fi
+          echo "CUDA_ROOT=$CUDA_ROOT"
+          echo "CUDA_ROOT=$CUDA_ROOT" >> "$GITHUB_ENV"
+          "$CUDA_ROOT/bin/nvcc" --version
+          echo "$CUDA_ROOT/bin" >> "$GITHUB_PATH"
+          echo "LIBRARY_PATH=$CUDA_ROOT/lib64/stubs:$CUDA_ROOT/compat" >> "$GITHUB_ENV"
+
+      - name: Configure CUDA build
+        run: |
+          cmake -S . -B build-cuda -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_CUDA=ON \
+            -DGGML_VULKAN=OFF \
+            -DCMAKE_CUDA_COMPILER="$CUDA_ROOT/bin/nvcc" \
+            -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_AVX2=ON \
+            -DGGML_FMA=ON \
+            -DGGML_F16C=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=ON \
+            -DCRISPASR_BUILD_SERVER=OFF
+
+      - name: Build CLI
+        run: cmake --build build-cuda --target crispasr-cli -j 4
+
+      - name: Package
+        run: |
+          mkdir -p artifact/crispasr-linux-x86_64-cuda12
+          cp build-cuda/bin/crispasr artifact/crispasr-linux-x86_64-cuda12/
+          cp LICENSE THIRD_PARTY_NOTICES.txt artifact/crispasr-linux-x86_64-cuda12/
+          ldd artifact/crispasr-linux-x86_64-cuda12/crispasr || true
+          tar -C artifact -czf artifact/crispasr-linux-x86_64-cuda12.tar.gz \
+            crispasr-linux-x86_64-cuda12
+          sha256sum artifact/crispasr-linux-x86_64-cuda12.tar.gz \
+            > artifact/crispasr-linux-x86_64-cuda12.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-linux-x86_64-cuda12
+          path: |
+            artifact/crispasr-linux-x86_64-cuda12.tar.gz
+            artifact/crispasr-linux-x86_64-cuda12.tar.gz.sha256
           if-no-files-found: error
           retention-days: 7
